@@ -70,7 +70,8 @@ from open_webui.tools.builtin import (
     view_chat,
     view_channel_message,
     view_channel_thread,
-    replace_note_content,
+    append_to_note,
+    find_and_replace,
     write_note,
     list_knowledge_bases,
     search_knowledge_bases,
@@ -442,21 +443,16 @@ def get_builtin_tools(
     # Otherwise, provide all KB browsing tools
     model_knowledge = model.get("info", {}).get("meta", {}).get("knowledge", [])
     if is_builtin_tool_enabled("knowledge"):
-        if model_knowledge:
-            # Model has attached knowledge - only allow semantic search within it
-            builtin_functions.append(query_knowledge_files)
-        else:
-            # No model knowledge - allow full KB browsing
-            builtin_functions.extend(
-                [
-                    list_knowledge_bases,
-                    search_knowledge_bases,
-                    query_knowledge_bases,
-                    search_knowledge_files,
-                    query_knowledge_files,
-                    view_knowledge_file,
-                ]
-            )
+        builtin_functions.extend(
+            [
+                list_knowledge_bases,
+                search_knowledge_bases,
+                query_knowledge_bases,
+                search_knowledge_files,
+                query_knowledge_files,
+                view_knowledge_file,
+            ]
+        )
 
     # Chats tools - search and fetch user's chat history
     if is_builtin_tool_enabled("chats"):
@@ -505,7 +501,7 @@ def get_builtin_tools(
         request.app.state.config, "ENABLE_NOTES", False
     ):
         builtin_functions.extend(
-            [search_notes, view_note, write_note, replace_note_content]
+            [search_notes, view_note, write_note, append_to_note, find_and_replace]
         )
 
     # Channels tools - search channels and messages (if builtin category enabled AND channels enabled globally)

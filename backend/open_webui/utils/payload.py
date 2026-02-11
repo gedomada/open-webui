@@ -50,7 +50,7 @@ def apply_model_params_to_body(
         return form_data
 
     for key, value in params.items():
-        if value is not None:
+        if value is not None and key not in form_data:
             if key in mappings:
                 cast_func = mappings[key]
                 if isinstance(cast_func, Callable):

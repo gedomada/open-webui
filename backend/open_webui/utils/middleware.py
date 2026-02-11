@@ -822,9 +822,17 @@ def apply_source_context_to_messages(
             if src_id not in citation_idx:
                 citation_idx[src_id] = len(citation_idx) + 1
             src_name = source.get("source", {}).get("name")
+            src_type = source.get("source", {}).get("type")
+            # Expose entity IDs so the model can use them with editing tools
+            note_id = meta.get("note_id") or (
+                source.get("source", {}).get("id") if src_type == "note" else None
+            )
+            file_id = meta.get("file_id") if src_type != "note" else None
             context_string += (
                 f'<source id="{citation_idx[src_id]}"'
                 + (f' name="{src_name}"' if src_name else "")
+                + (f' note_id="{note_id}"' if note_id else "")
+                + (f' file_id="{file_id}"' if file_id else "")
                 + f">{doc}</source>\n"
             )
 
@@ -2052,21 +2060,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     user_message = get_last_user_message(form_data["messages"])
     model_knowledge = model.get("info", {}).get("meta", {}).get("knowledge", False)
 
-    if (
-        model_knowledge
-        and metadata.get("params", {}).get("function_calling") != "native"
-    ):
-        await event_emitter(
-            {
-                "type": "status",
-                "data": {
-                    "action": "knowledge_search",
-                    "query": user_message,
-                    "done": False,
-                },
-            }
-        )
-
+    if model_knowledge:
         knowledge_files = []
         for item in model_knowledge:
             if item.get("collection_name"):
@@ -2075,6 +2069,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         "id": item.get("collection_name"),
                         "name": item.get("name"),
                         "legacy": True,
+                        "context": "full",
                     }
                 )
             elif item.get("collection_names"):
@@ -2084,10 +2079,11 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         "type": "collection",
                         "collection_names": item.get("collection_names"),
                         "legacy": True,
+                        "context": "full",
                     }
                 )
             else:
-                knowledge_files.append(item)
+                knowledge_files.append({**item, "context": "full"})
 
         files = form_data.get("files", [])
         files.extend(knowledge_files)
@@ -2465,6 +2461,10 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 {"type": "function", "function": tool.get("spec", {})}
                 for tool in tools_dict.values()
             ]
+            # Explicitly set tool_choice to "auto" so the model can respond
+            # without being forced to call a tool on every turn
+            if "tool_choice" not in form_data:
+                form_data["tool_choice"] = "auto"
 
         else:
             # If the function calling is not native, then call the tools function calling handler
@@ -3305,9 +3305,12 @@ async def streaming_chat_response_handler(response, ctx):
 
             reasoning_tags_param = metadata.get("params", {}).get("reasoning_tags")
             DETECT_REASONING_TAGS = reasoning_tags_param is not False
+            # Disable text-based <code_interpreter> tag detection when native
+            # function calling is active — code execution is handled by the
+            # execute_python_code native tool instead.
             DETECT_CODE_INTERPRETER = metadata.get("features", {}).get(
                 "code_interpreter", False
-            )
+            ) and metadata.get("params", {}).get("function_calling") != "native"
 
             reasoning_tags = []
             if DETECT_REASONING_TAGS:
