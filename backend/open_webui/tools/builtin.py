@@ -14,6 +14,7 @@ from typing import Optional
 
 from fastapi import Request
 
+from open_webui.utils.files import get_image_url_from_base64
 from open_webui.models.users import UserModel
 from open_webui.routers.retrieval import search_web as _search_web
 from open_webui.retrieval.utils import get_content_from_url
@@ -834,20 +835,18 @@ async def write_note(
         log.exception(f"write_note error: {e}")
         return json.dumps({"error": str(e)})
 
-
-async def replace_note_content(
+async def append_to_note(
     note_id: str,
     content: str,
-    title: Optional[str] = None,
     __request__: Request = None,
     __user__: dict = None,
 ) -> str:
     """
-    Update the content of a note. Use this to modify task lists, add notes, or update content.
+    Append text to the end of an existing note. Use this to add new sections,
+    paragraphs, or items without overwriting the existing content.
 
-    :param note_id: The ID of the note to update
-    :param content: The new markdown content for the note
-    :param title: Optional new title for the note
+    :param note_id: The ID of the note to append to
+    :param content: The markdown content to append at the end of the note
     :return: JSON with success status and updated note info
     """
     if __request__ is None:
@@ -879,28 +878,94 @@ async def replace_note_content(
         ):
             return json.dumps({"error": "Write access denied"})
 
-        # Build update form
-        update_data = {"data": {"content": {"md": content}}}
-        if title:
-            update_data["title"] = title
+        # Get existing content and append
+        existing_content = ""
+        if note.data and note.data.get("content", {}).get("md"):
+            existing_content = note.data["content"]["md"]
 
-        form = NoteUpdateForm(**update_data)
+        new_content = existing_content + "\n" + content if existing_content else content
+
+        form = NoteUpdateForm(data={"content": {"md": new_content}})
         updated_note = Notes.update_note_by_id(note_id, form)
 
         if not updated_note:
             return json.dumps({"error": "Failed to update note"})
 
-        return json.dumps(
-            {
-                "status": "success",
-                "id": updated_note.id,
-                "title": updated_note.title,
-                "updated_at": updated_note.updated_at,
-            },
-            ensure_ascii=False,
-        )
+        return json.dumps({"status": "success"})
     except Exception as e:
-        log.exception(f"replace_note_content error: {e}")
+        log.exception(f"append_to_note error: {e}")
+        return json.dumps({"error": str(e)})
+
+
+async def find_and_replace(
+    note_id: str,
+    old: str,
+    new: str,
+    __request__: Request = None,
+    __user__: dict = None,
+) -> str:
+    """
+    Find and replace a specific text fragment in an existing note.
+    The old text must be present in the note — an error is returned if it is not found.
+    Only the first occurrence is replaced. Use view_note first to see the current content.
+
+    Examples:
+      - Fix a typo: old="teh quick brown fox", new="the quick brown fox"
+      - Update a status: old="- [ ] Buy groceries", new="- [x] Buy groceries"
+      - Replace a paragraph:
+          old="## Old heading\\nOld paragraph text.",
+          new="## New heading\\nUpdated paragraph text."
+
+    :param note_id: The ID of the note to edit
+    :param old: The exact text to find (must exist in the note)
+    :param new: The replacement text
+    :return: JSON with success status and updated note info
+    """
+    if __request__ is None:
+        return json.dumps({"error": "Request context not available"})
+
+    if not __user__:
+        return json.dumps({"error": "User context not available"})
+
+    try:
+        from open_webui.models.notes import NoteUpdateForm
+
+        note = Notes.get_note_by_id(note_id)
+
+        if not note:
+            return json.dumps({"error": "Note not found"})
+
+        # Check write permission
+        user_id = __user__.get("id")
+        user_group_ids = [group.id for group in Groups.get_groups_by_member_id(user_id)]
+
+        from open_webui.utils.access_control import has_access
+
+        if note.user_id != user_id and not has_access(
+            user_id, "write", note.access_control, user_group_ids
+        ):
+            return json.dumps({"error": "Write access denied"})
+
+        # Get existing content
+        existing_content = ""
+        if note.data and note.data.get("content", {}).get("md"):
+            existing_content = note.data["content"]["md"]
+
+        if old not in existing_content:
+            return json.dumps({"error": f"Text not found in note"})
+
+        new_content = existing_content.replace(old, new, 1)
+
+        form = NoteUpdateForm(data={"content": {"md": new_content}})
+        updated_note = Notes.update_note_by_id(note_id, form)
+
+        if not updated_note:
+            return json.dumps({"error": "Failed to update note"})
+
+        return json.dumps({"status": "success"})
+    
+    except Exception as e:
+        log.exception(f"find_and_replace error: {e}")
         return json.dumps({"error": str(e)})
 
 
@@ -1954,4 +2019,140 @@ async def view_skill(
         )
     except Exception as e:
         log.exception(f"view_skill error: {e}")
+        return json.dumps({"error": str(e)})
+
+
+# =============================================================================
+# CODE INTERPRETER
+# =============================================================================
+
+
+async def execute_python_code(
+    code: str,
+    __request__: Request = None,
+    __user__: dict = None,
+    __event_call__: callable = None,
+    __metadata__: dict = None,
+) -> str:
+    """
+    Execute Python code in a sandboxed interpreter and return the output.
+    Use this for calculations, data analysis, visualizations, or any task
+    that benefits from running code. Always print meaningful results.
+
+    :param code: The Python code to execute
+    :return: Execution output with stdout, stderr, and result
+    """
+    if __request__ is None:
+        return json.dumps({"error": "Request context not available"})
+
+    metadata = __metadata__ or {}
+
+    try:
+        from open_webui.config import CODE_INTERPRETER_BLOCKED_MODULES
+        import textwrap
+
+        if CODE_INTERPRETER_BLOCKED_MODULES:
+            blocking_code = textwrap.dedent(
+                f"""
+                import builtins
+
+                BLOCKED_MODULES = {CODE_INTERPRETER_BLOCKED_MODULES}
+
+                _real_import = builtins.__import__
+                def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+                    if name.split('.')[0] in BLOCKED_MODULES:
+                        importer_name = globals.get('__name__') if globals else None
+                        if importer_name == '__main__':
+                            raise ImportError(
+                                f"Direct import of module {{name}} is restricted."
+                            )
+                    return _real_import(name, globals, locals, fromlist, level)
+
+                builtins.__import__ = restricted_import
+                """
+            )
+            code = blocking_code + "\n" + code
+
+        engine = __request__.app.state.config.CODE_INTERPRETER_ENGINE
+
+        if engine == "pyodide":
+            if __event_call__ is None:
+                return json.dumps(
+                    {"error": "Event caller not available for pyodide engine"}
+                )
+
+            from uuid import uuid4
+
+            output = await __event_call__(
+                {
+                    "type": "execute:python",
+                    "data": {
+                        "id": str(uuid4()),
+                        "code": code,
+                        "session_id": metadata.get("session_id", None),
+                    },
+                }
+            )
+        elif engine == "jupyter":
+            from open_webui.utils.code_interpreter import execute_code_jupyter
+
+            output = await execute_code_jupyter(
+                __request__.app.state.config.CODE_INTERPRETER_JUPYTER_URL,
+                code,
+                (
+                    __request__.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH_TOKEN
+                    if __request__.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH
+                    == "token"
+                    else None
+                ),
+                (
+                    __request__.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH_PASSWORD
+                    if __request__.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH
+                    == "password"
+                    else None
+                ),
+                __request__.app.state.config.CODE_INTERPRETER_JUPYTER_TIMEOUT,
+            )
+        else:
+            return json.dumps(
+                {"error": f"Code interpreter engine '{engine}' not configured"}
+            )
+
+        if not isinstance(output, dict):
+            return str(output)
+
+
+        user = UserModel(**__user__) if __user__ else None
+        def _process_images(text: str) -> str:
+            # Process base64 images in stdout and result, matching the behaviour
+            # of the text-based code interpreter handler in middleware.py.
+
+            if not text or not isinstance(text, str):
+                return text or ""
+            lines = text.split("\n")
+            for idx, line in enumerate(lines):
+                if "data:image/png;base64" in line:
+                    image_url = get_image_url_from_base64(
+                        __request__, line, metadata, user
+                    )
+                    if image_url:
+                        lines[idx] = f"![Output Image]({image_url})"
+            return "\n".join(lines)
+
+        stdout = _process_images(output.get("stdout", ""))
+        stderr = output.get("stderr", "")
+        result = _process_images(output.get("result", ""))
+
+        parts = []
+        if stdout:
+            parts.append(f"STDOUT:\n{stdout}")
+        if stderr:
+            parts.append(f"STDERR:\n{stderr}")
+        if result:
+            parts.append(f"RESULT:\n{result}")
+
+        return "\n\n".join(parts) if parts else "(no output)"
+
+    except Exception as e:
+        log.exception(f"execute_python_code error: {e}")
         return json.dumps({"error": str(e)})
