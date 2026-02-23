@@ -441,6 +441,7 @@ def get_builtin_tools(
     if is_builtin_tool_enabled("time"):
         builtin_functions.extend([get_current_timestamp, calculate_timestamp])
 
+    model_knowledge = model.get("info", {}).get("meta", {}).get("knowledge", [])
     if is_builtin_tool_enabled("knowledge"):
         builtin_functions.extend(
             [
