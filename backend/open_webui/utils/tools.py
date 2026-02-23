@@ -60,6 +60,8 @@ from open_webui.tools.builtin import (
     search_memories,
     add_memory,
     replace_memory_content,
+    delete_memory,
+    list_memories,
     get_current_timestamp,
     calculate_timestamp,
     search_notes,
@@ -78,6 +80,7 @@ from open_webui.tools.builtin import (
     query_knowledge_bases,
     search_knowledge_files,
     query_knowledge_files,
+    view_file,
     view_knowledge_file,
     view_skill,
 )
@@ -438,10 +441,6 @@ def get_builtin_tools(
     if is_builtin_tool_enabled("time"):
         builtin_functions.extend([get_current_timestamp, calculate_timestamp])
 
-    # Knowledge base tools - conditional injection based on model knowledge
-    # If model has attached knowledge (any type), only provide query_knowledge_files
-    # Otherwise, provide all KB browsing tools
-    model_knowledge = model.get("info", {}).get("meta", {}).get("knowledge", [])
     if is_builtin_tool_enabled("knowledge"):
         builtin_functions.extend(
             [
@@ -450,6 +449,7 @@ def get_builtin_tools(
                 query_knowledge_bases,
                 search_knowledge_files,
                 query_knowledge_files,
+                view_file,
                 view_knowledge_file,
             ]
         )
@@ -460,7 +460,15 @@ def get_builtin_tools(
 
     # Add memory tools if builtin category enabled AND enabled for this chat
     if is_builtin_tool_enabled("memory") and features.get("memory"):
-        builtin_functions.extend([search_memories, add_memory, replace_memory_content])
+        builtin_functions.extend(
+            [
+                search_memories,
+                add_memory,
+                replace_memory_content,
+                delete_memory,
+                list_memories,
+            ]
+        )
 
     # Add web search tools if builtin category enabled AND enabled globally AND model has web_search capability
     if (
