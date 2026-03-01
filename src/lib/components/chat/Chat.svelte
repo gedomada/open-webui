@@ -844,11 +844,14 @@
 
 		// Create file items first
 		const fileItems = urls.map((url) => ({
+			itemId: uuidv4(),
+			id: uuidv4(),
 			type: 'text',
 			name: url,
 			collection_name: '',
 			status: 'uploading',
 			context: 'full',
+			content: '',
 			url,
 			error: ''
 		}));
@@ -860,20 +863,33 @@
 			try {
 				const res = isYoutubeUrl(fileItem.url)
 					? await processYoutubeVideo(localStorage.token, fileItem.url)
-					: await processWeb(localStorage.token, '', fileItem.url);
+					: await processWeb(localStorage.token, '', fileItem.url, false);
 
 				if (res) {
+					const extractedContent = res?.file?.data?.content ?? res?.content ?? '';
+					const extractedFile =
+						res?.file ??
+						{
+							data: {
+								content: extractedContent
+							},
+							meta: {
+								name: fileItem.url,
+								source: fileItem.url
+							}
+						};
+
 					fileItem.status = 'uploaded';
-					fileItem.collection_name = res.collection_name;
-					fileItem.file = {
-						...res.file,
-						...fileItem.file
-					};
+					fileItem.collection_name = res?.collection_name ?? '';
+					fileItem.content = extractedContent;
+					fileItem.file = extractedFile;
 				}
 
 				files = [...files];
 			} catch (e) {
-				files = files.filter((f) => f.name !== url);
+				fileItem.status = 'error';
+				fileItem.error = `${e}`;
+				files = files.filter((f) => f.itemId !== fileItem.itemId);
 				toast.error(`${e}`);
 			}
 		}

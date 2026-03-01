@@ -1017,10 +1017,7 @@ async def get_sources_from_items(
 
             if query_result is None:
                 # Fallback
-                if item.get("collection_name"):
-                    # If item has a collection name, use it
-                    collection_names.append(item.get("collection_name"))
-                elif item.get("file"):
+                if item.get("file", {}).get("data", {}).get("content"):
                     # If item has file data, use it
                     query_result = {
                         "documents": [
@@ -1028,6 +1025,23 @@ async def get_sources_from_items(
                         ],
                         "metadatas": [[item.get("file", {}).get("meta", {})]],
                     }
+                elif item.get("content"):
+                    # If item has direct content, use it first
+                    query_result = {
+                        "documents": [[item.get("content")]],
+                        "metadatas": [
+                            [
+                                {
+                                    "file_id": item.get("id"),
+                                    "name": item.get("name"),
+                                    "source": item.get("url") or item.get("name"),
+                                }
+                            ]
+                        ],
+                    }
+                elif item.get("collection_name"):
+                    # If item has only a collection name, query the vector store
+                    collection_names.append(item.get("collection_name"))
                 else:
                     # Fallback to item content
                     query_result = {

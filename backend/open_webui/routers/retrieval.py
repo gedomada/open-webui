@@ -1993,7 +1993,18 @@ async def process_web(
         else:
             return {
                 "status": True,
+                "collection_name": None,
+                "filename": form_data.url,
                 "content": content,
+                "file": {
+                    "data": {
+                        "content": content,
+                    },
+                    "meta": {
+                        "name": form_data.url,
+                        "source": form_data.url,
+                    },
+                },
             }
     except Exception as e:
         log.exception(e)
