@@ -156,8 +156,7 @@ async def search_web(
 ) -> str:
     """
     Search the public web for information. Best for current events, external references,
-    or topics not covered in internal documents. If knowledge base tools are available,
-    consider checking those first for internal information.
+    or topics not covered in internal documents.
 
     :param query: The search query to look up
     :param count: Number of results to return (default: 5)
@@ -251,11 +250,13 @@ async def generate_image(
 
         # Persist files to DB if chat context is available
         if __chat_id__ and __message_id__ and images:
-            image_files = Chats.add_message_files_by_id_and_message_id(
+            db_files = Chats.add_message_files_by_id_and_message_id(
                 __chat_id__,
                 __message_id__,
                 image_files,
             )
+            if db_files is not None:
+                image_files = db_files
 
         # Emit the images to the UI if event emitter is available
         if __event_emitter__ and image_files:
@@ -316,11 +317,13 @@ async def edit_image(
 
         # Persist files to DB if chat context is available
         if __chat_id__ and __message_id__ and images:
-            image_files = Chats.add_message_files_by_id_and_message_id(
+            db_files = Chats.add_message_files_by_id_and_message_id(
                 __chat_id__,
                 __message_id__,
                 image_files,
             )
+            if db_files is not None:
+                image_files = db_files
 
         # Emit the images to the UI if event emitter is available
         if __event_emitter__ and image_files:
@@ -426,6 +429,9 @@ async def execute_code(
                         "code": code,
                         "session_id": (
                             __metadata__.get("session_id") if __metadata__ else None
+                        ),
+                        "files": (
+                            __metadata__.get("files", []) if __metadata__ else []
                         ),
                     },
                 }

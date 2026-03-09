@@ -65,6 +65,7 @@
 	import { AudioQueue } from '$lib/utils/audio';
 
 	import {
+		archiveChatById,
 		createNewChat,
 		getAllTags,
 		getChatById,
@@ -104,6 +105,7 @@
 	import Tooltip from '../common/Tooltip.svelte';
 	import Sidebar from '../icons/Sidebar.svelte';
 	import Image from '../common/Image.svelte';
+	import { getBanners } from '$lib/apis/configs';
 
 	export let chatIdProp = '';
 
@@ -405,11 +407,14 @@
 	};
 
 	const terminalEventHandler = (type: string, data: any) => {
-		if (!data?.path) return;
 		if (type === 'terminal:display_file') {
+			if (!data?.path) return;
 			displayFileHandler(data.path, { showControls, showFileNavPath });
-		} else if (type === 'terminal:write_file') {
+		} else if (type === 'terminal:write_file' || type === 'terminal:replace_file_content') {
+			if (!data?.path) return;
 			showFileNavDir.set(data.path);
+		} else if (type === 'terminal:run_command') {
+			showFileNavDir.set('/');
 		}
 	};
 
@@ -644,6 +649,13 @@
 			if (p.url.pathname === '/') {
 				await tick();
 				initNewChat();
+
+				// Re-fetch banners on navigation to homepage so newly configured banners appear
+				try {
+					banners.set(await getBanners(localStorage.token).catch(() => []));
+				} catch (e) {
+					console.error('Failed to refresh banners:', e);
+				}
 			}
 
 			stopAudio();
@@ -938,15 +950,19 @@
 		}
 	};
 
-	$: if (history) {
-		cancelAnimationFrame(contentsRAF);
-		contentsRAF = requestAnimationFrame(() => {
-			getContents();
-			contentsRAF = null;
-		});
-	} else {
-		artifactContents.set([]);
-	}
+	const onHistoryChange = (history) => {
+		if (history) {
+			cancelAnimationFrame(contentsRAF);
+			contentsRAF = requestAnimationFrame(() => {
+				getContents();
+				contentsRAF = null;
+			});
+		} else {
+			artifactContents.set([]);
+		}
+	};
+
+	$: onHistoryChange(history);
 
 	const getContents = () => {
 		const messages = history ? createMessagesList(history, history.currentId) : [];
@@ -1577,27 +1593,29 @@
 						navigator.vibrate(5);
 					}
 
-					// Emit chat event for TTS
-					const messageContentParts = getMessageContentParts(
-						removeAllDetails(message.content),
-						$config?.audio?.tts?.split_on ?? 'punctuation'
-					);
-					messageContentParts.pop();
-
-					// dispatch only last sentence and make sure it hasn't been dispatched before
-					if (
-						messageContentParts.length > 0 &&
-						messageContentParts[messageContentParts.length - 1] !== message.lastSentence
-					) {
-						message.lastSentence = messageContentParts[messageContentParts.length - 1];
-						eventTarget.dispatchEvent(
-							new CustomEvent('chat', {
-								detail: {
-									id: message.id,
-									content: messageContentParts[messageContentParts.length - 1]
-								}
-							})
+					// Emit chat event for TTS (only when call overlay is active)
+					if ($showCallOverlay) {
+						const messageContentParts = getMessageContentParts(
+							removeAllDetails(message.content),
+							$config?.audio?.tts?.split_on ?? 'punctuation'
 						);
+						messageContentParts.pop();
+
+						// dispatch only last sentence and make sure it hasn't been dispatched before
+						if (
+							messageContentParts.length > 0 &&
+							messageContentParts[messageContentParts.length - 1] !== message.lastSentence
+						) {
+							message.lastSentence = messageContentParts[messageContentParts.length - 1];
+							eventTarget.dispatchEvent(
+								new CustomEvent('chat', {
+									detail: {
+										id: message.id,
+										content: messageContentParts[messageContentParts.length - 1]
+									}
+								})
+							);
+						}
 					}
 				}
 			}
@@ -1611,27 +1629,29 @@
 				navigator.vibrate(5);
 			}
 
-			// Emit chat event for TTS
-			const messageContentParts = getMessageContentParts(
-				removeAllDetails(message.content),
-				$config?.audio?.tts?.split_on ?? 'punctuation'
-			);
-			messageContentParts.pop();
-
-			// dispatch only last sentence and make sure it hasn't been dispatched before
-			if (
-				messageContentParts.length > 0 &&
-				messageContentParts[messageContentParts.length - 1] !== message.lastSentence
-			) {
-				message.lastSentence = messageContentParts[messageContentParts.length - 1];
-				eventTarget.dispatchEvent(
-					new CustomEvent('chat', {
-						detail: {
-							id: message.id,
-							content: messageContentParts[messageContentParts.length - 1]
-						}
-					})
+			// Emit chat event for TTS (only when call overlay is active)
+			if ($showCallOverlay) {
+				const messageContentParts = getMessageContentParts(
+					removeAllDetails(message.content),
+					$config?.audio?.tts?.split_on ?? 'punctuation'
 				);
+				messageContentParts.pop();
+
+				// dispatch only last sentence and make sure it hasn't been dispatched before
+				if (
+					messageContentParts.length > 0 &&
+					messageContentParts[messageContentParts.length - 1] !== message.lastSentence
+				) {
+					message.lastSentence = messageContentParts[messageContentParts.length - 1];
+					eventTarget.dispatchEvent(
+						new CustomEvent('chat', {
+							detail: {
+								id: message.id,
+								content: messageContentParts[messageContentParts.length - 1]
+							}
+						})
+					);
+				}
 			}
 		}
 
@@ -1658,18 +1678,20 @@
 				document.getElementById(`speak-button-${message.id}`)?.click();
 			}
 
-			// Emit chat event for TTS
-			let lastMessageContentPart =
-				getMessageContentParts(
-					removeAllDetails(message.content),
-					$config?.audio?.tts?.split_on ?? 'punctuation'
-				)?.at(-1) ?? '';
-			if (lastMessageContentPart) {
-				eventTarget.dispatchEvent(
-					new CustomEvent('chat', {
-						detail: { id: message.id, content: lastMessageContentPart }
-					})
-				);
+			// Emit chat event for TTS (only when call overlay is active)
+			if ($showCallOverlay) {
+				let lastMessageContentPart =
+					getMessageContentParts(
+						removeAllDetails(message.content),
+						$config?.audio?.tts?.split_on ?? 'punctuation'
+					)?.at(-1) ?? '';
+				if (lastMessageContentPart) {
+					eventTarget.dispatchEvent(
+						new CustomEvent('chat', {
+							detail: { id: message.id, content: lastMessageContentPart }
+						})
+					);
+				}
 			}
 			eventTarget.dispatchEvent(
 				new CustomEvent('chat:finish', {
@@ -2007,6 +2029,17 @@
 		return features;
 	};
 
+	const getStopTokens = () => {
+		const stop = params?.stop ?? $settings?.params?.stop;
+		if (!stop) return undefined;
+
+		const tokens = Array.isArray(stop) ? stop : stop.split(',').map((s) => s.trim());
+
+		return tokens
+			.filter(Boolean)
+			.map((token) => decodeURIComponent(JSON.parse(`"${token.replace(/"/g, '\\"')}"`)));
+	};
+
 	const sendMessageSocket = async (model, _messages, _history, responseMessageId, _chatId) => {
 		const responseMessage = _history.messages[responseMessageId];
 		const userMessage = _history.messages[responseMessage.parentId];
@@ -2168,12 +2201,7 @@
 				params: {
 					...$settings?.params,
 					...params,
-					stop:
-						(params?.stop ?? $settings?.params?.stop ?? undefined)
-							? (params?.stop.split(',').map((token) => token.trim()) ?? $settings.params.stop).map(
-									(str) => decodeURIComponent(JSON.parse('"' + str.replace(/\"/g, '\\"') + '"'))
-								)
-							: undefined
+					stop: getStopTokens()
 				},
 
 				files: (files?.length ?? 0) > 0 ? files : undefined,
@@ -2601,6 +2629,25 @@
 			toast.error($i18n.t('Failed to move chat'));
 		}
 	};
+
+	const archiveChatHandler = async (id: string) => {
+		try {
+			await archiveChatById(localStorage.token, id);
+			currentChatPage.set(1);
+			initNewChat();
+			await goto('/');
+			getChatList(localStorage.token, $currentChatPage).then((chats) => {
+				chats.set(chats);
+			});
+			getPinnedChatList(localStorage.token).then((pinnedChats) => {
+				pinnedChats.set(pinnedChats);
+			});
+			toast.success($i18n.t('Chat archived.'));
+		} catch (error) {
+			console.error('Error archiving chat:', error);
+			toast.error($i18n.t('Failed to archive chat.'));
+		}
+	};
 </script>
 
 <svelte:head>
@@ -2683,7 +2730,7 @@
 						bind:selectedModels
 						shareEnabled={!!history.currentId}
 						{initNewChat}
-						archiveChatHandler={() => {}}
+						{archiveChatHandler}
 						{moveChatHandler}
 						onSaveTempChat={async () => {
 							try {
@@ -2893,6 +2940,7 @@
 					{stopResponse}
 					{showMessage}
 					{eventTarget}
+					{codeInterpreterEnabled}
 				/>
 			</PaneGroup>
 		</div>
