@@ -205,17 +205,7 @@ def convert_output_to_messages(output: list, raw: bool = False) -> list[dict]:
             # Flush any pending content/tool_calls before adding tool result
             flush_pending()
 
-            # Extract text from output content parts
-            output_parts = item.get("output", [])
-            content = ""
-            for part in output_parts:
-                if part.get("type") == "input_text":
-                    output_text = part.get("text", "")
-                    content += (
-                        str(output_text)
-                        if not isinstance(output_text, str)
-                        else output_text
-                    )
+            content = extract_function_call_output_text(item.get("output", []))
 
             messages.append(
                 {
@@ -227,19 +217,32 @@ def convert_output_to_messages(output: list, raw: bool = False) -> list[dict]:
 
         elif item_type == "reasoning":
             if raw:
-                # Include reasoning with original tags for LLM re-processing
-                reasoning_text = ""
-                source_list = item.get("summary", []) or item.get("content", [])
-                for part in source_list:
-                    if part.get("type") == "output_text":
-                        reasoning_text += part.get("text", "")
-                    elif "text" in part:
-                        reasoning_text += part.get("text", "")
+                # Native reasoning (returned via dedicated API fields like
+                # reasoning_content / reasoning / thinking) should NOT be
+                # injected back as text — the provider handles it internally
+                # and the model does not expect to see it in content.
+                # Only text-tag reasoning (DeepSeek / Qwen style <think> in
+                # content) should be preserved for re-processing.
+                attrs = item.get("attributes") or {}
+                is_native = attrs.get("type") == "reasoning_content"
 
-                if reasoning_text:
-                    start_tag = item.get("start_tag", "<think>")
-                    end_tag = item.get("end_tag", "</think>")
-                    pending_content.append(f"{start_tag}{reasoning_text}{end_tag}")
+                if not is_native:
+                    reasoning_text = ""
+                    source_list = item.get("summary", []) or item.get(
+                        "content", []
+                    )
+                    for part in source_list:
+                        if part.get("type") == "output_text":
+                            reasoning_text += part.get("text", "")
+                        elif "text" in part:
+                            reasoning_text += part.get("text", "")
+
+                    if reasoning_text:
+                        start_tag = item.get("start_tag", "<think>")
+                        end_tag = item.get("end_tag", "</think>")
+                        pending_content.append(
+                            f"{start_tag}{reasoning_text}{end_tag}"
+                        )
             # else: skip reasoning blocks for normal LLM messages
 
         elif item_type == "open_webui:code_interpreter":
@@ -273,6 +276,241 @@ def convert_output_to_messages(output: list, raw: bool = False) -> list[dict]:
     flush_pending()
 
     return messages
+
+
+def _normalize_responses_message_content(
+    content: list[dict],
+) -> Optional[list[dict]]:
+    normalized = []
+
+    for part in content or []:
+        part_type = part.get("type")
+
+        if part_type in {"output_text", "input_text"}:
+            normalized.append({"type": part_type, "text": part.get("text", "")})
+        elif part_type == "text":
+            normalized.append({"type": "output_text", "text": part.get("text", "")})
+        elif part_type == "refusal":
+            normalized.append({"type": "refusal", "refusal": part.get("refusal", "")})
+        else:
+            return None
+
+    return normalized
+
+
+def _normalize_responses_reasoning_parts(
+    parts: list[dict], part_type: str
+) -> Optional[list[dict]]:
+    normalized = []
+
+    for part in parts or []:
+        text = part.get("text")
+        if text is None:
+            return None
+
+        normalized.append({"type": part_type, "text": text})
+
+    return normalized
+
+
+def extract_function_call_output_text(output: object) -> str:
+    if isinstance(output, str):
+        return output
+
+    if isinstance(output, list):
+        content = ""
+        for part in output:
+            if not isinstance(part, dict):
+                content += str(part)
+                continue
+
+            if part.get("type") == "input_text":
+                output_text = part.get("text", "")
+                content += (
+                    str(output_text)
+                    if not isinstance(output_text, str)
+                    else output_text
+                )
+            elif "text" in part:
+                output_text = part.get("text", "")
+                content += (
+                    str(output_text)
+                    if not isinstance(output_text, str)
+                    else output_text
+                )
+
+        return content
+
+    if output is None:
+        return ""
+
+    return str(output)
+
+
+def normalize_function_call_output_to_input_parts(
+    output: object,
+) -> list[dict]:
+    if isinstance(output, list):
+        normalized_output = _normalize_responses_message_content(output)
+        if normalized_output is not None:
+            for part in normalized_output:
+                if part["type"] == "output_text":
+                    part["type"] = "input_text"
+            return normalized_output
+
+    return [{"type": "input_text", "text": extract_function_call_output_text(output)}]
+
+
+def _is_native_reasoning_output_item(item: dict) -> bool:
+    attrs = item.get("attributes") or {}
+
+    return item.get("type") == "reasoning" and (
+        attrs.get("type") == "reasoning_content"
+        or (not item.get("start_tag") and not item.get("end_tag"))
+    )
+
+
+def convert_output_to_responses_input_items(
+    output: list,
+) -> Optional[list[dict]]:
+    """
+    Convert stored OR-aligned output items back into Responses API input items.
+
+    Returns None when the output contains Open WebUI-only extension items that
+    cannot be replayed natively and should fall back to chat-style messages.
+    """
+    if not isinstance(output, list):
+        return None
+
+    input_items = []
+
+    for item in output:
+        item_type = item.get("type", "")
+
+        if item_type == "message":
+            content = _normalize_responses_message_content(item.get("content", []))
+            if content is None:
+                return None
+
+            input_items.append(
+                {
+                    "type": "message",
+                    "role": item.get("role", "assistant"),
+                    "content": content,
+                    **({"id": item.get("id")} if item.get("id") else {}),
+                    **({"status": item.get("status")} if item.get("status") else {}),
+                }
+            )
+
+        elif item_type == "function_call":
+            arguments = item.get("arguments", "{}")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments)
+
+            input_items.append(
+                {
+                    "type": "function_call",
+                    "call_id": item.get("call_id", ""),
+                    "name": item.get("name", ""),
+                    "arguments": arguments,
+                    **({"id": item.get("id")} if item.get("id") else {}),
+                    **({"status": item.get("status")} if item.get("status") else {}),
+                }
+            )
+
+        elif item_type == "function_call_output":
+            normalized_output = normalize_function_call_output_to_input_parts(
+                item.get("output", [])
+            )
+
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": item.get("call_id", ""),
+                    "output": normalized_output,
+                    **({"id": item.get("id")} if item.get("id") else {}),
+                    **({"status": item.get("status")} if item.get("status") else {}),
+                }
+            )
+
+        elif item_type == "reasoning":
+            if not _is_native_reasoning_output_item(item):
+                return None
+
+            content = _normalize_responses_reasoning_parts(
+                item.get("content", []), "reasoning_text"
+            )
+            summary = _normalize_responses_reasoning_parts(
+                item.get("summary", []), "summary_text"
+            )
+            if content is None or summary is None:
+                return None
+
+            input_items.append(
+                {
+                    "type": "reasoning",
+                    **({"id": item.get("id")} if item.get("id") else {}),
+                    **({"status": item.get("status")} if item.get("status") else {}),
+                    **({"content": content} if content else {}),
+                    **({"summary": summary} if summary else {}),
+                    **(
+                        {"encrypted_content": item.get("encrypted_content")}
+                        if item.get("encrypted_content")
+                        else {}
+                    ),
+                }
+            )
+
+        elif item_type.startswith("open_webui:"):
+            return None
+
+        else:
+            return None
+
+    return input_items
+
+
+def get_pending_function_calls_from_output(output: list) -> list[dict]:
+    """
+    Extract function calls that still need tool execution from stored output.
+    """
+    if not isinstance(output, list):
+        return []
+
+    completed_call_ids = {
+        item.get("call_id")
+        for item in output
+        if item.get("type") == "function_call_output" and item.get("call_id")
+    }
+
+    pending_tool_calls = []
+    seen_call_ids = set()
+
+    for item in output:
+        if item.get("type") != "function_call":
+            continue
+
+        call_id = item.get("call_id") or item.get("id", "")
+        if not call_id or call_id in completed_call_ids or call_id in seen_call_ids:
+            continue
+
+        arguments = item.get("arguments", "{}")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments)
+
+        pending_tool_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": item.get("name", ""),
+                    "arguments": arguments,
+                },
+            }
+        )
+        seen_call_ids.add(call_id)
+
+    return pending_tool_calls
 
 
 def get_last_user_message(messages: list[dict]) -> Optional[str]:

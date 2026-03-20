@@ -96,7 +96,10 @@ from open_webui.utils.misc import (
     prepend_to_first_user_message_content,
     convert_logit_bias_input_to_json,
     get_content_from_message,
+    convert_output_to_responses_input_items,
     convert_output_to_messages,
+    extract_function_call_output_text,
+    get_pending_function_calls_from_output,
 )
 from open_webui.utils.tools import (
     get_tools,
@@ -435,15 +438,9 @@ def serialize_output(output: list) -> str:
 
             result_item = tool_outputs.get(call_id)
             if result_item:
-                result_text = ""
-                for result_output in result_item.get("output", []):
-                    if "text" in result_output:
-                        output_text = result_output.get("text", "")
-                        result_text += (
-                            str(output_text)
-                            if not isinstance(output_text, str)
-                            else output_text
-                        )
+                result_text = extract_function_call_output_text(
+                    result_item.get("output", [])
+                )
                 files = result_item.get("files")
                 embeds = result_item.get("embeds", "")
 
@@ -555,9 +552,83 @@ def deep_merge(target, source):
         return source
 
 
+def get_openai_api_config_for_model(
+    request: Request, model: Optional[dict], model_id: Optional[str] = None
+) -> dict:
+    """
+    Resolve the upstream OpenAI API config for the current model selection.
+    """
+    candidate_model = None
+
+    if model_id:
+        candidate_model = (
+            request.app.state.MODELS.get(model_id)
+            or request.app.state.OPENAI_MODELS.get(model_id)
+        )
+
+    candidate_model = candidate_model or model
+    if not candidate_model or candidate_model.get("owned_by") != "openai":
+        return {}
+
+    openai_models = request.app.state.OPENAI_MODELS or {}
+    candidate_ids = [
+        candidate_model.get("id"),
+        candidate_model.get("base_model_id"),
+        (candidate_model.get("info") or {}).get("base_model_id")
+        if isinstance(candidate_model.get("info"), dict)
+        else None,
+    ]
+
+    resolved_model = None
+    for candidate_id in candidate_ids:
+        if not candidate_id:
+            continue
+
+        resolved_model = openai_models.get(candidate_id)
+        if resolved_model:
+            break
+
+        base_candidate_id = candidate_id.split(":")[0]
+        resolved_model = openai_models.get(base_candidate_id)
+        if resolved_model:
+            break
+
+    url_idx = None
+    if resolved_model and resolved_model.get("urlIdx") is not None:
+        url_idx = resolved_model.get("urlIdx")
+    elif candidate_model.get("urlIdx") is not None:
+        url_idx = candidate_model.get("urlIdx")
+
+    if url_idx is None:
+        return {}
+
+    api_base_urls = request.app.state.config.OPENAI_API_BASE_URLS
+    api_configs = request.app.state.config.OPENAI_API_CONFIGS
+
+    try:
+        base_url = api_base_urls[url_idx]
+    except (IndexError, TypeError):
+        return {}
+
+    return api_configs.get(str(url_idx), api_configs.get(base_url, {}))
+
+
+def uses_responses_api_model(
+    request: Request, model: Optional[dict], model_id: Optional[str] = None
+) -> bool:
+    return get_openai_api_config_for_model(
+        request, model, model_id=model_id
+    ).get("api_type") == "responses"
+
+
+def should_replay_output_natively_with_responses(output: list) -> bool:
+    return convert_output_to_responses_input_items(output) is not None
+
+
 def handle_responses_streaming_event(
     data: dict,
     current_output: list,
+    output_index_offset: int = 0,
 ) -> tuple[list, dict | None]:
     """
     Handle Responses API streaming events in a pure functional way.
@@ -576,6 +647,7 @@ def handle_responses_streaming_event(
     # We will shallow copy only if we need to modify the list structure or items.
 
     event_type = data.get("type", "")
+    default_output_index = max(len(current_output) - output_index_offset - 1, 0)
 
     if event_type == "response.output_item.added":
         item = data.get("item", {})
@@ -587,7 +659,9 @@ def handle_responses_streaming_event(
 
     elif event_type == "response.content_part.added":
         part = data.get("part", {})
-        output_index = data.get("output_index", len(current_output) - 1)
+        output_index = output_index_offset + data.get(
+            "output_index", default_output_index
+        )
 
         if current_output and 0 <= output_index < len(current_output):
             new_output = list(current_output)
@@ -611,7 +685,9 @@ def handle_responses_streaming_event(
 
     elif event_type == "response.reasoning_summary_part.added":
         part = data.get("part", {})
-        output_index = data.get("output_index", len(current_output) - 1)
+        output_index = output_index_offset + data.get(
+            "output_index", default_output_index
+        )
 
         if current_output and 0 <= output_index < len(current_output):
             new_output = list(current_output)
@@ -634,7 +710,10 @@ def handle_responses_streaming_event(
             delta_type = parts[1]
             delta = data.get("delta", "")
 
-            output_index = data.get("output_index", len(current_output) - 1)
+            output_index = output_index_offset + data.get(
+                "output_index", default_output_index
+            )
+            new_output = current_output
 
             if current_output and 0 <= output_index < len(current_output):
                 new_output = list(current_output)
@@ -760,7 +839,9 @@ def handle_responses_streaming_event(
                 # If payloads contains the full part, we could update it.
                 # Usually purely signaling in standard implementation, but we check payload.
                 part = data.get("part")
-                output_index = data.get("output_index", len(current_output) - 1)
+                output_index = output_index_offset + data.get(
+                    "output_index", default_output_index
+                )
 
                 if part and current_output and 0 <= output_index < len(current_output):
                     new_output = list(current_output)
@@ -779,7 +860,9 @@ def handle_responses_streaming_event(
 
             elif type_name == "reasoning_summary_part":
                 part = data.get("part")
-                output_index = data.get("output_index", len(current_output) - 1)
+                output_index = output_index_offset + data.get(
+                    "output_index", default_output_index
+                )
 
                 if part and current_output and 0 <= output_index < len(current_output):
                     new_output = list(current_output)
@@ -802,7 +885,9 @@ def handle_responses_streaming_event(
 
             # 3. Generic Field Done (text.done, audio.done)
             elif type_name not in ["completed", "failed"]:
-                output_index = data.get("output_index", len(current_output) - 1)
+                output_index = output_index_offset + data.get(
+                    "output_index", default_output_index
+                )
                 if current_output and 0 <= output_index < len(current_output):
 
                     key = (
@@ -849,7 +934,9 @@ def handle_responses_streaming_event(
     elif event_type == "response.output_item.done":
         # Delta Event: Output item complete
         item = data.get("item")
-        output_index = data.get("output_index", len(current_output) - 1)
+        output_index = output_index_offset + data.get(
+            "output_index", default_output_index
+        )
 
         new_output = list(current_output)
         if item and 0 <= output_index < len(current_output):
@@ -863,7 +950,11 @@ def handle_responses_streaming_event(
         response_data = data.get("response", {})
         final_output = response_data.get("output")
 
-        new_output = final_output if final_output is not None else current_output
+        if final_output is not None:
+            prefix = current_output[:output_index_offset] if output_index_offset else []
+            new_output = [*prefix, *final_output]
+        else:
+            new_output = current_output
 
         # Ensure reasoning items are marked as completed in the final output
         if new_output:
@@ -2125,17 +2216,27 @@ def load_messages_from_db(chat_id: str, message_id: str) -> Optional[list[dict]]
     ]
 
 
-def process_messages_with_output(messages: list[dict]) -> list[dict]:
+def process_messages_with_output(
+    messages: list[dict], preserve_responses_output: bool = False
+) -> list[dict]:
     """
     Process messages with OR-aligned output items for LLM consumption.
 
     For assistant messages with 'output' field, produces properly formatted
-    OpenAI-style messages (tool_calls + tool results). Strips 'output' before LLM.
+    OpenAI-style messages (tool_calls + tool results). When the upstream model
+    uses the Responses API, keep natively replayable output items intact so
+    reasoning/function calls can be sent back as Responses conversation items.
     """
     processed = []
 
     for message in messages:
         if message.get("role") == "assistant" and message.get("output"):
+            if preserve_responses_output and should_replay_output_natively_with_responses(
+                message["output"]
+            ):
+                processed.append(message)
+                continue
+
             # Use output items for clean OpenAI-format messages
             output_messages = convert_output_to_messages(message["output"], raw=True)
             if output_messages:
@@ -2195,8 +2296,15 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 # Strip files field — it's been incorporated into content
                 message.pop("files", None)
 
+    preserve_responses_output = uses_responses_api_model(
+        request, model, model_id=form_data.get("model")
+    )
+
     # Process messages with OR-aligned output items for clean LLM messages
-    form_data["messages"] = process_messages_with_output(form_data.get("messages", []))
+    form_data["messages"] = process_messages_with_output(
+        form_data.get("messages", []),
+        preserve_responses_output=preserve_responses_output,
+    )
 
     system_message = get_system_message(form_data.get("messages", []))
     if system_message:  # Chat Controls/User Settings
@@ -3275,6 +3383,27 @@ async def streaming_chat_response_handler(response, ctx):
         task_id = str(uuid4())  # Create a unique task ID.
         model_id = form_data.get("model", "")
 
+        def using_responses_api() -> bool:
+            return uses_responses_api_model(request, model, model_id=model_id)
+
+        def build_follow_up_messages(output: list) -> list[dict]:
+            if using_responses_api() and should_replay_output_natively_with_responses(
+                output
+            ):
+                return [
+                    *form_data["messages"],
+                    {
+                        "role": "assistant",
+                        "content": serialize_output(output),
+                        "output": copy.deepcopy(output),
+                    },
+                ]
+
+            return [
+                *form_data["messages"],
+                *convert_output_to_messages(output, raw=True),
+            ]
+
         # Handle as a background task
         async def response_handler(response, events):
             def tag_output_handler(content_type, tags, output):
@@ -3610,7 +3739,9 @@ async def streaming_chat_response_handler(response, ctx):
                         },
                     )
 
-                async def stream_body_handler(response, form_data):
+                async def stream_body_handler(
+                    response, form_data, responses_output_index_offset: int = 0
+                ):
                     nonlocal content
                     nonlocal usage
                     nonlocal output
@@ -3695,7 +3826,11 @@ async def streaming_chat_response_handler(response, ctx):
                                 # Check for Responses API events (type field starts with "response.")
                                 elif data.get("type", "").startswith("response."):
                                     output, response_metadata = (
-                                        handle_responses_streaming_event(data, output)
+                                        handle_responses_streaming_event(
+                                            data,
+                                            output,
+                                            output_index_offset=responses_output_index_offset,
+                                        )
                                     )
 
                                     processed_data = {
@@ -4199,6 +4334,12 @@ async def streaming_chat_response_handler(response, ctx):
 
                     if response_tool_calls:
                         tool_calls.append(_split_tool_calls(response_tool_calls))
+                    elif using_responses_api():
+                        pending_tool_calls = get_pending_function_calls_from_output(
+                            output
+                        )
+                        if pending_tool_calls:
+                            tool_calls.append(_split_tool_calls(pending_tool_calls))
 
                     if response.background:
                         await response.background()
@@ -4240,16 +4381,26 @@ async def streaming_chat_response_handler(response, ctx):
                     for tc in response_tool_calls:
                         call_id = tc.get("id", "")
                         func = tc.get("function", {})
-                        output.append(
-                            {
-                                "type": "function_call",
-                                "id": call_id or output_id("fc"),
-                                "call_id": call_id,
-                                "name": func.get("name", ""),
-                                "arguments": func.get("arguments", "{}"),
-                                "status": "in_progress",
-                            }
+                        existing_function_call = next(
+                            (
+                                item
+                                for item in output
+                                if item.get("type") == "function_call"
+                                and item.get("call_id") == call_id
+                            ),
+                            None,
                         )
+                        if existing_function_call is None:
+                            output.append(
+                                {
+                                    "type": "function_call",
+                                    "id": call_id or output_id("fc"),
+                                    "call_id": call_id,
+                                    "name": func.get("name", ""),
+                                    "arguments": func.get("arguments", "{}"),
+                                    "status": "in_progress",
+                                }
+                            )
 
                     await event_emitter(
                         {
@@ -4462,16 +4613,19 @@ async def streaming_chat_response_handler(response, ctx):
                             }
                         )
 
-                    # Append a new empty message item for the next response
-                    output.append(
-                        {
-                            "type": "message",
-                            "id": output_id("msg"),
-                            "status": "in_progress",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": ""}],
-                        }
-                    )
+                    if not using_responses_api():
+                        # Chat Completions-style continuations need an empty
+                        # assistant message placeholder to keep streaming text
+                        # appended to the current turn.
+                        output.append(
+                            {
+                                "type": "message",
+                                "id": output_id("msg"),
+                                "status": "in_progress",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": ""}],
+                            }
+                        )
 
                     # Emit citation sources to the frontend for display
                     if citations_enabled:
@@ -4545,10 +4699,7 @@ async def streaming_chat_response_handler(response, ctx):
                             **form_data,
                             "model": model_id,
                             "stream": True,
-                            "messages": [
-                                *form_data["messages"],
-                                *convert_output_to_messages(output, raw=True),
-                            ],
+                            "messages": build_follow_up_messages(output),
                         }
 
                         res = await generate_chat_completion(
@@ -4559,7 +4710,13 @@ async def streaming_chat_response_handler(response, ctx):
                         )
 
                         if isinstance(res, StreamingResponse):
-                            await stream_body_handler(res, new_form_data)
+                            await stream_body_handler(
+                                res,
+                                new_form_data,
+                                responses_output_index_offset=len(output)
+                                if using_responses_api()
+                                else 0,
+                            )
                         else:
                             break
                     except Exception as e:
@@ -4705,15 +4862,16 @@ async def streaming_chat_response_handler(response, ctx):
                         ci_item["output"] = ci_output
                         ci_item["status"] = "completed"
 
-                        output.append(
-                            {
-                                "type": "message",
-                                "id": output_id("msg"),
-                                "status": "in_progress",
-                                "role": "assistant",
-                                "content": [{"type": "output_text", "text": ""}],
-                            }
-                        )
+                        if not using_responses_api():
+                            output.append(
+                                {
+                                    "type": "message",
+                                    "id": output_id("msg"),
+                                    "status": "in_progress",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": ""}],
+                                }
+                            )
 
                         await event_emitter(
                             {
@@ -4730,10 +4888,7 @@ async def streaming_chat_response_handler(response, ctx):
                                 **form_data,
                                 "model": model_id,
                                 "stream": True,
-                                "messages": [
-                                    *form_data["messages"],
-                                    *convert_output_to_messages(output, raw=True),
-                                ],
+                                "messages": build_follow_up_messages(output),
                             }
 
                             res = await generate_chat_completion(
@@ -4744,7 +4899,13 @@ async def streaming_chat_response_handler(response, ctx):
                             )
 
                             if isinstance(res, StreamingResponse):
-                                await stream_body_handler(res, new_form_data)
+                                await stream_body_handler(
+                                    res,
+                                    new_form_data,
+                                    responses_output_index_offset=len(output)
+                                    if using_responses_api()
+                                    else 0,
+                                )
                             else:
                                 break
                         except Exception as e:

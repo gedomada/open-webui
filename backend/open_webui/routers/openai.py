@@ -50,6 +50,7 @@ from open_webui.utils.payload import (
 )
 from open_webui.utils.misc import (
     cleanup_response,
+    convert_output_to_responses_input_items,
     convert_logit_bias_input_to_json,
     stream_chunks_handler,
     stream_wrapper,
@@ -843,8 +844,10 @@ def convert_to_responses_payload(payload: dict) -> dict:
         # Check for stored output items (from previous Responses API turn)
         stored_output = msg.get("output")
         if stored_output and isinstance(stored_output, list):
-            input_items.extend(stored_output)
-            continue
+            converted_output = convert_output_to_responses_input_items(stored_output)
+            if converted_output is not None:
+                input_items.extend(converted_output)
+                continue
 
         if role == "system":
             if isinstance(content, str):

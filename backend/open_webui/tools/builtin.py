@@ -45,6 +45,65 @@ log = logging.getLogger(__name__)
 
 MAX_KNOWLEDGE_BASE_SEARCH_ITEMS = 10_000
 
+NOTE_MARKDOWN_PREFIXES = (
+    "#",
+    "- ",
+    "* ",
+    "+ ",
+    "> ",
+    "```",
+    "|",
+    "[ ] ",
+    "[x] ",
+    "1. ",
+    "2. ",
+    "3. ",
+)
+
+NOTE_MARKDOWN_LINEBREAK_HINTS = (
+    "\\r\\n",
+    "\\n\\n",
+    "\\n#",
+    "\\n- ",
+    "\\n* ",
+    "\\n+ ",
+    "\\n> ",
+    "\\n```",
+    "\\n|",
+    "\\n[",
+    "\\n1. ",
+    "\\n2. ",
+    "\\n3. ",
+)
+
+
+def _normalize_note_markdown_text(value: str) -> str:
+    """
+    Some models double-escape markdown line breaks in tool arguments
+    (for example, returning "\\n\\n### Heading" instead of actual newlines).
+    Decode only markdown-leaning inputs to avoid changing path-like strings.
+    """
+    if not isinstance(value, str) or "\\" not in value:
+        return value
+
+    if "\\n" not in value and "\\r" not in value:
+        return value
+
+    stripped = value.lstrip()
+    should_decode = (
+        value.startswith(("\\n", "\\r"))
+        or value.endswith(("\\n", "\\r"))
+        or value.count("\\n") >= 2
+        or any(hint in value for hint in NOTE_MARKDOWN_LINEBREAK_HINTS)
+        or ("\\n" in value and stripped.startswith(NOTE_MARKDOWN_PREFIXES))
+    )
+
+    if not should_decode:
+        return value
+
+    return value.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\r")
+
+
 # =============================================================================
 # TIME UTILITIES
 # =============================================================================
@@ -390,7 +449,8 @@ async def execute_code(
         if CODE_INTERPRETER_BLOCKED_MODULES:
             import textwrap
 
-            blocking_code = textwrap.dedent(f"""
+            blocking_code = textwrap.dedent(
+                f"""
                 import builtins
 
                 BLOCKED_MODULES = {CODE_INTERPRETER_BLOCKED_MODULES}
@@ -406,7 +466,8 @@ async def execute_code(
                     return _real_import(name, globals, locals, fromlist, level)
 
                 builtins.__import__ = restricted_import
-                """)
+                """
+            )
             code = blocking_code + "\n" + code
 
         engine = getattr(
@@ -876,6 +937,7 @@ async def write_note(
 ) -> str:
     """
     Create a new note with the given title and content.
+    Use actual line breaks for markdown structure instead of escaped newline text.
 
     :param title: The title of the new note
     :param content: The markdown content for the note
@@ -891,6 +953,7 @@ async def write_note(
         from open_webui.models.notes import NoteForm
 
         user_id = __user__.get("id")
+        content = _normalize_note_markdown_text(content)
 
         form = NoteForm(
             title=title,
@@ -916,6 +979,7 @@ async def write_note(
         log.exception(f"write_note error: {e}")
         return json.dumps({"error": str(e)})
 
+
 async def append_to_note(
     note_id: str,
     content: str,
@@ -925,6 +989,7 @@ async def append_to_note(
     """
     Append text to the end of an existing note. Use this to add new sections,
     paragraphs, or items without overwriting the existing content.
+    Use actual line breaks for markdown structure instead of escaped newline text.
 
     :param note_id: The ID of the note to append to
     :param content: The markdown content to append at the end of the note
@@ -964,7 +1029,18 @@ async def append_to_note(
         if note.data and note.data.get("content", {}).get("md"):
             existing_content = note.data["content"]["md"]
 
-        new_content = existing_content + "\n" + content if existing_content else content
+        content = _normalize_note_markdown_text(content)
+
+        separator = ""
+        if existing_content and content:
+            if not existing_content.endswith(("\n", "\r")) and not content.startswith(
+                ("\n", "\r")
+            ):
+                separator = "\n"
+
+        new_content = (
+            existing_content + separator + content if existing_content else content
+        )
 
         form = NoteUpdateForm(data={"content": {"md": new_content}})
         updated_note = Notes.update_note_by_id(note_id, form)
@@ -989,13 +1065,12 @@ async def find_and_replace(
     Find and replace a specific text fragment in an existing note.
     The old text must be present in the note — an error is returned if it is not found.
     Only the first occurrence is replaced. Use view_note first to see the current content.
+    Use actual line breaks in old and new when matching multi-line markdown.
 
     Examples:
       - Fix a typo: old="teh quick brown fox", new="the quick brown fox"
       - Update a status: old="- [ ] Buy groceries", new="- [x] Buy groceries"
-      - Replace a paragraph:
-          old="## Old heading\\nOld paragraph text.",
-          new="## New heading\\nUpdated paragraph text."
+      - Replace a paragraph with real line breaks between lines.
 
     :param note_id: The ID of the note to edit
     :param old: The exact text to find (must exist in the note)
@@ -1032,6 +1107,9 @@ async def find_and_replace(
         if note.data and note.data.get("content", {}).get("md"):
             existing_content = note.data["content"]["md"]
 
+        old = _normalize_note_markdown_text(old)
+        new = _normalize_note_markdown_text(new)
+
         if old not in existing_content:
             return json.dumps({"error": f"Text not found in note"})
 
@@ -1044,7 +1122,7 @@ async def find_and_replace(
             return json.dumps({"error": "Failed to update note"})
 
         return json.dumps({"status": "success"})
-    
+
     except Exception as e:
         log.exception(f"find_and_replace error: {e}")
         return json.dumps({"error": str(e)})
