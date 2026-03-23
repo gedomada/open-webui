@@ -1031,12 +1031,7 @@ async def append_to_note(
 
         content = _normalize_note_markdown_text(content)
 
-        separator = ""
-        if existing_content and content:
-            if not existing_content.endswith(("\n", "\r")) and not content.startswith(
-                ("\n", "\r")
-            ):
-                separator = "\n"
+        separator = "\n" if existing_content and content else ""
 
         new_content = (
             existing_content + separator + content if existing_content else content
